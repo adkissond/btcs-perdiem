@@ -151,12 +151,20 @@
     return { total: rate, breakfast: b, lunch: l, dinner: d, incidental: rate - b - l - d, derived: true };
   }
 
+  var ratesPromise = null;
   function loadRates() {
-    return fetch(ratesUrl, { cache: 'no-cache' }).then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status); return r.json();
-    }).then(function (j) { rates = j; ratesError = ''; })
-      .catch(function (e) { rates = null; ratesError = e.message; });
+    var url = new URL(ratesUrl, window.location.href).href;
+    ratesPromise = fetch(url, { cache: 'no-cache' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url); return r.json();
+    }).then(function (j) {
+      if (!j || !j.years) throw new Error('not a gsa_rates.json file: ' + url);
+      rates = j; ratesError = '';
+      setStatus('Rates loaded: FY' + Object.keys(j.years).join(', FY') + '. Enter travel dates and destination.', 'ok');
+    }).catch(function (e) { rates = null; ratesError = e.message; setStatus('Rate file could not be loaded (' + ratesError + ').', 'warn'); });
+    return ratesPromise;
   }
+  // Load as soon as the page opens, so it also works when previewed outside Jotform.
+  loadRates();
 
   // Localities for a state in a fiscal year, with the standard rate first.
   function buildLocalities(st, fy) {
@@ -306,10 +314,10 @@
 
   // ---- Jotform lifecycle -------------------------------------------------------------
   JFCustomWidget.subscribe('ready', function (data) {
-    ratesUrl = JFCustomWidget.getWidgetSetting('rates_url') || ratesUrl;
+    var custom = JFCustomWidget.getWidgetSetting('rates_url');
     outputMode = (JFCustomWidget.getWidgetSetting('output') || 'number').toLowerCase();
-    loadRates().then(function () {
-      if (!rates) setStatus('Rate file could not be loaded (' + ratesError + ') - rates must be chosen manually.', 'warn');
+    if (custom && custom !== ratesUrl) { ratesUrl = custom; loadRates(); }
+    ratesPromise.then(function () {
       // Restore when editing a submission saved in json mode.
       if (data && data.value && data.value.charAt(0) === '{') {
         try {
