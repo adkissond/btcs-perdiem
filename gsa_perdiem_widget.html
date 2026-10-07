@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GSA Per Diem - M&amp;IE Calculator</title>
+<!--
+  Jotform custom widget: GSA M&IE per diem by destination, from a hosted rates file.
+
+  FILES (host both in the same HTTPS folder):
+      gsa_perdiem_widget.html   this file
+      gsa_rates.json            built from GSA's annual workbook by gsa_rates_to_json.py
+
+  REGISTER at https://www.jotform.com/developers/widgets  (Add Widget -> iFrame)
+      iFrame URL : https://<your-host>/gsa_perdiem_widget.html
+      Parameters : rates_url   (optional) URL of gsa_rates.json; default = gsa_rates.json next to this file
+                   output      (optional) "number" (default) | "json"
+
+  output=number : the widget's saved value is just the M&IE total (e.g. 192.00),
+                  so a Jotform Form Calculation field can use it directly.
+                  The day-by-day detail is shown on screen with a Copy button
+                  for the "M&IE detail" text field.
+  output=json   : the saved value is the full JSON record (destination, rates,
+                  per-day lines, total).
+
+  EACH OCTOBER: download the new FYxxxx_PerDiemRates workbook from gsa.gov,
+  run  python3 gsa_rates_to_json.py --merge gsa_rates.json FYxxxx_*.xlsx
+  and upload the new gsa_rates.json.  Old years stay in the file, so claims
+  for earlier travel keep the rate in effect on the travel date.
+
+  Rules applied (Federal Travel Regulation 301-11):
+    - fiscal year = Oct 1 .. Sep 30, chosen from each travel day's date
+    - overnight travel only (the form hides the widget for day trips)
+    - first and last travel day = 75% of the full M&IE rate
+    - meals provided (conference / registration) are deducted at the GSA
+      breakdown amount for that rate tier; incidentals ($5) never deducted
+    - a day never goes below $0
+-->
+<style>
+  :root { --ink:#1f2937; --muted:#6b7280; --line:#d1d5db; --bg:#ffffff; --warn:#b45309; --ok:#047857; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:8px 4px; font:14px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  .row { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:10px; }
+  .field { display:flex; flex-direction:column; min-width:150px; flex:1; }
+  label { font-size:12px; color:var(--muted); margin-bottom:3px; }
+  input, select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:4px; background:#fff; }
+  table { width:100%; border-collapse:collapse; margin-top:6px; font-size:13px; }
+  th, td { border-bottom:1px solid var(--line); padding:6px 4px; text-align:left; white-space:nowrap; }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); }
+  td.num, th.num { text-align:right; }
+  td.c, th.c { text-align:center; }
+  .total { display:flex; justify-content:space-between; align-items:baseline; margin-top:10px; padding-top:8px; border-top:2px solid var(--ink); font-size:16px; }
+  .total b { font-size:20px; }
+  .status { font-size:12px; color:var(--muted); margin-top:6px; min-height:16px; }
+  .status.warn { color:var(--warn); }
+  .status.ok { color:var(--ok); }
+  button { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:4px; background:#f9fafb; cursor:pointer; }
+  button:hover { background:#f3f4f6; }
+  #manual { display:none; padding:8px; border:1px dashed var(--warn); border-radius:4px; margin-top:8px; }
+  .hint { font-size:12px; color:var(--muted); }
+  textarea { width:100%; font:12px/1.35 ui-monospace, Menlo, Consolas, monospace; height:120px; border:1px solid var(--line); border-radius:4px; padding:6px; }
+</style>
+</head>
+<body>
+
+<div class="row">
+  <div class="field"><label for="depart">Departure date</label><input type="date" id="depart"></div>
+  <div class="field"><label for="return">Return date</label><input type="date" id="return"></div>
+</div>
+<div class="row">
+  <div class="field"><label for="state">Destination state</label><select id="state"><option value="">Select state</option></select></div>
+  <div class="field" style="flex:2"><label for="locality">Destination city / county</label>
+    <select id="locality" disabled><option value="">Select state first</option></select></div>
+</div>
+<div class="status" id="status">Enter travel dates and destination.</div>
+
+<div id="manual">
+  <div class="hint">Rates for this travel date are not loaded yet. Look up the destination at
+    <a href="https://www.gsa.gov/travel/plan-book/per-diem-rates" target="_blank" rel="noopener">gsa.gov/perdiem</a>
+    and choose the M&amp;IE rate; the Business Office will verify.</div>
+  <select id="manualRate"></select>
+</div>
+
+<table id="grid" style="display:none">
+  <thead><tr>
+    <th>Date</th><th>Day</th><th class="num">Rate</th>
+    <th class="c" title="Breakfast provided">B</th><th class="c" title="Lunch provided">L</th><th class="c" title="Dinner provided">D</th>
+    <th class="num">Deducted</th><th class="num">M&amp;IE</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+<div class="hint" id="gridHint" style="display:none">Check B / L / D for any meal provided by the conference or included in registration. Complimentary hotel breakfast is not deducted.</div>
+
+<div class="total" id="totalRow" style="display:none"><span>Meals &amp; incidentals total</span><b id="total">$0.00</b></div>
+
+<div class="row" id="detailRow" style="display:none; margin-top:8px">
+  <div class="field" style="flex:1 1 100%">
+    <label>Day-by-day detail (copy into the "M&amp;IE detail" box on the form)</label>
+    <textarea id="detail" readonly></textarea>
+    <div style="margin-top:6px"><button type="button" id="copyBtn">Copy detail</button> <span class="hint" id="copyMsg"></span></div>
+  </div>
+</div>
+
+<script src="//js.jotform.com/JotFormCustomWidget.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // Used only if gsa_rates.json has no breakdown for a year (verify each October).
+  var FALLBACK_BREAKDOWN = [
+    { total: 68, breakfast: 16, lunch: 19, dinner: 28, incidental: 5 },
+    { total: 74, breakfast: 18, lunch: 20, dinner: 31, incidental: 5 },
+    { total: 80, breakfast: 20, lunch: 22, dinner: 33, incidental: 5 },
+    { total: 86, breakfast: 22, lunch: 23, dinner: 36, incidental: 5 },
+    { total: 92, breakfast: 23, lunch: 26, dinner: 38, incidental: 5 }
+  ];
+  var FIRST_LAST_PCT = 0.75;
+
+  var STATES = {AL:'Alabama',AK:'Alaska',AZ:'Arizona',AR:'Arkansas',CA:'California',CO:'Colorado',CT:'Connecticut',DE:'Delaware',DC:'District of Columbia',FL:'Florida',GA:'Georgia',HI:'Hawaii',ID:'Idaho',IL:'Illinois',IN:'Indiana',IA:'Iowa',KS:'Kansas',KY:'Kentucky',LA:'Louisiana',ME:'Maine',MD:'Maryland',MA:'Massachusetts',MI:'Michigan',MN:'Minnesota',MS:'Mississippi',MO:'Missouri',MT:'Montana',NE:'Nebraska',NV:'Nevada',NH:'New Hampshire',NJ:'New Jersey',NM:'New Mexico',NY:'New York',NC:'North Carolina',ND:'North Dakota',OH:'Ohio',OK:'Oklahoma',OR:'Oregon',PA:'Pennsylvania',RI:'Rhode Island',SC:'South Carolina',SD:'South Dakota',TN:'Tennessee',TX:'Texas',UT:'Utah',VT:'Vermont',VA:'Virginia',WA:'Washington',WV:'West Virginia',WI:'Wisconsin',WY:'Wyoming'};
+
+  var ratesUrl = 'gsa_rates.json';
+  var outputMode = 'number';
+  var rates = null;              // parsed gsa_rates.json
+  var ratesError = '';
+  var localities = [];           // for the selected state/FY: [{label, mie, seasons, destination, county}]
+  var state = { days: [], fy: null, dest: null, manual: false, total: 0 };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var el = { depart: $('depart'), ret: $('return'), state: $('state'), loc: $('locality'), status: $('status'),
+             grid: $('grid'), body: $('grid').querySelector('tbody'), total: $('total'), totalRow: $('totalRow'),
+             detail: $('detail'), detailRow: $('detailRow'), manual: $('manual'), manualRate: $('manualRate'),
+             gridHint: $('gridHint') };
+
+  Object.keys(STATES).sort(function (a, b) { return STATES[a] < STATES[b] ? -1 : 1; }).forEach(function (st) {
+    var o = document.createElement('option'); o.value = st; o.textContent = STATES[st] + ' (' + st + ')'; el.state.appendChild(o);
+  });
+
+  function parseDate(s) { var p = s.split('-'); return new Date(+p[0], +p[1] - 1, +p[2]); }
+  function iso(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+  function fiscalYear(isoDate) { var d = parseDate(isoDate); return String(d.getMonth() >= 9 ? d.getFullYear() + 1 : d.getFullYear()); }
+  function money(n) { return '$' + n.toFixed(2); }
+  function setStatus(msg, cls) { el.status.textContent = msg; el.status.className = 'status ' + (cls || ''); resize(); }
+  function resize() { try { JFCustomWidget.requestFrameResize({ height: document.body.scrollHeight + 16 }); } catch (e) {} }
+
+  function yearData(fy) { return rates && rates.years && rates.years[fy] ? rates.years[fy] : null; }
+  function breakdownFor(fy) { var y = yearData(fy); return (y && y.mieBreakdown && y.mieBreakdown.length) ? y.mieBreakdown : FALLBACK_BREAKDOWN; }
+  function tierFor(rate, fy) {
+    var bd = breakdownFor(fy);
+    for (var i = 0; i < bd.length; i++) if (+bd[i].total === +rate) return bd[i];
+    var b = Math.round(rate * 0.15), l = Math.round(rate * 0.25), d = Math.round(rate * 0.40);
+    return { total: rate, breakfast: b, lunch: l, dinner: d, incidental: rate - b - l - d, derived: true };
+  }
+
+  function loadRates() {
+    return fetch(ratesUrl, { cache: 'no-cache' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status); return r.json();
+    }).then(function (j) { rates = j; ratesError = ''; })
+      .catch(function (e) { rates = null; ratesError = e.message; });
+  }
+
+  // Localities for a state in a fiscal year, with the standard rate first.
+  function buildLocalities(st, fy) {
+    var y = yearData(fy);
+    localities = [];
+    if (!y) return false;
+    localities.push({ label: 'All other locations in ' + STATES[st] + ' (standard rate)', mie: y.standard.mie,
+                      seasons: [{ begin: y.effective, end: y.through, lodging: y.standard.lodging }], destination: 'Standard', county: '' });
+    y.localities.filter(function (l) { return l.state === st; }).forEach(function (l) {
+      var label = l.county && l.destination.toLowerCase() !== l.county.toLowerCase() ? l.destination + ' (' + l.county + ' County)' : l.destination;
+      localities.push({ label: label, mie: l.mie, seasons: l.seasons, destination: l.destination, county: l.county });
+    });
+    el.loc.innerHTML = '<option value="">Select destination</option>';
+    localities.forEach(function (l, i) {
+      var o = document.createElement('option'); o.value = i; o.textContent = l.label + ' - M&IE $' + l.mie; el.loc.appendChild(o);
+    });
+    el.loc.disabled = false;
+    return true;
+  }
+
+  function showManual(fy) {
+    state.manual = true;
+    el.loc.innerHTML = '<option value="">(rates not loaded)</option>'; el.loc.disabled = true;
+    el.manualRate.innerHTML = '';
+    breakdownFor(fy).forEach(function (t) { var o = document.createElement('option'); o.value = t.total; o.textContent = '$' + t.total + ' per day' + (t.total === 68 ? ' (standard CONUS)' : ''); el.manualRate.appendChild(o); });
+    el.manual.style.display = 'block';
+  }
+
+  function lodgingRef(loc, dateIso) {
+    if (!loc || !loc.seasons) return null;
+    for (var i = 0; i < loc.seasons.length; i++) { var s = loc.seasons[i]; if (dateIso >= s.begin && dateIso <= s.end) return s.lodging; }
+    return loc.seasons[0] ? loc.seasons[0].lodging : null;
+  }
+
+  function buildDays() {
+    var a = el.depart.value, b = el.ret.value;
+    var prev = {}; state.days.forEach(function (x) { prev[x.date] = x; });
+    state.days = [];
+    if (!a || !b) return;
+    var d0 = parseDate(a), d1 = parseDate(b);
+    if (d1 < d0) { setStatus('Return date is before departure date.', 'warn'); return; }
+    var n = Math.round((d1 - d0) / 864e5);
+    if (n > 30) { setStatus('Trips longer than 31 days need Business Office review - enter in two parts.', 'warn'); return; }
+    if (n === 0) { setStatus('Same-day travel: no overnight stay, meals are not reimbursable.', 'warn'); return; }
+    for (var i = 0; i <= n; i++) {
+      var d = new Date(d0); d.setDate(d0.getDate() + i);
+      var k = iso(d), old = prev[k] || {};
+      state.days.push({ date: k, kind: i === 0 ? 'depart' : (i === n ? 'return' : 'full'), b: !!old.b, l: !!old.l, d: !!old.d });
+    }
+  }
+
+  function selectState() {
+    var st = el.state.value;
+    if (!st) { el.loc.innerHTML = '<option value="">Select state first</option>'; el.loc.disabled = true; return; }
+    if (!el.depart.value) { setStatus('Enter the departure date first (rates depend on the fiscal year).', 'warn'); el.state.value = ''; return; }
+    var fy = fiscalYear(el.depart.value); state.fy = fy; state.manual = false; el.manual.style.display = 'none';
+    if (!rates) { showManual(fy); setStatus('Rate file could not be loaded (' + ratesError + ').', 'warn'); return; }
+    if (!buildLocalities(st, fy)) {
+      showManual(fy);
+      setStatus('FY' + fy + ' rates are not in the rate file yet (have: ' + Object.keys(rates.years || {}).join(', ') + '). Business Office: run gsa_rates_to_json.py for FY' + fy + '.', 'warn');
+      return;
+    }
+    var y = yearData(fy);
+    setStatus('GSA FY' + fy + ' rates (' + (y.source || 'gsa.gov') + ', effective ' + y.effective + ').', 'ok');
+  }
+
+  function currentRate() {
+    if (state.manual) return +el.manualRate.value || 68;
+    var i = el.loc.value; if (i === '') return null;
+    state.dest = localities[+i]; return state.dest.mie;
+  }
+
+  function compute() {
+    var rate = currentRate();
+    state.rate = rate;
+    if (!state.days.length || rate === null) { el.grid.style.display = 'none'; el.gridHint.style.display = 'none'; el.totalRow.style.display = 'none'; el.detailRow.style.display = 'none'; send(false); return; }
+    var tier = tierFor(rate, state.fy), total = 0, lines = [];
+    el.body.innerHTML = '';
+    state.days.forEach(function (day, idx) {
+      var base = day.kind === 'full' ? rate : +(rate * FIRST_LAST_PCT).toFixed(2);
+      var ded = (day.b ? tier.breakfast : 0) + (day.l ? tier.lunch : 0) + (day.d ? tier.dinner : 0);
+      var amt = Math.max(0, +(base - ded).toFixed(2));
+      day.base = base; day.deducted = ded; day.amount = amt; total += amt;
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + day.date + '</td><td>' + (day.kind === 'full' ? 'full day' : day.kind + ' (75%)') + '</td>' +
+        '<td class="num">' + money(base) + '</td>' +
+        '<td class="c"><input type="checkbox" data-i="' + idx + '" data-m="b"' + (day.b ? ' checked' : '') + '></td>' +
+        '<td class="c"><input type="checkbox" data-i="' + idx + '" data-m="l"' + (day.l ? ' checked' : '') + '></td>' +
+        '<td class="c"><input type="checkbox" data-i="' + idx + '" data-m="d"' + (day.d ? ' checked' : '') + '></td>' +
+        '<td class="num">' + (ded ? '-' + money(ded) : '') + '</td><td class="num"><b>' + money(amt) + '</b></td>';
+      el.body.appendChild(tr);
+      var prov = [day.b ? 'B' : '', day.l ? 'L' : '', day.d ? 'D' : ''].join('') || '-';
+      lines.push(day.date + '  ' + (day.kind === 'full' ? 'full  ' : day.kind.padEnd(6)) + ' base ' + money(base).padStart(7) + '  provided ' + prov.padEnd(3) + ' deducted ' + money(ded).padStart(7) + '  M&IE ' + money(amt).padStart(7));
+    });
+    total = +total.toFixed(2);
+    state.total = total;
+    var y = yearData(state.fy);
+    var src = state.manual ? 'manual entry - verify' : ('GSA FY' + state.fy + (y && y.source ? ' (' + y.source + ')' : ''));
+    var destLabel = state.manual ? 'manual rate' : (state.dest.label + ', ' + el.state.value);
+    var lodging = state.manual ? null : lodgingRef(state.dest, state.days[0].date);
+    var header = 'Destination: ' + destLabel + '\nM&IE rate: $' + rate + '/day (' + src + ')' +
+      (lodging !== null ? '\nGSA lodging rate for reference: $' + lodging + '/night' : '') +
+      '\nBreakdown used: B $' + tier.breakfast + ' / L $' + tier.lunch + ' / D $' + tier.dinner + ' / IE $' + tier.incidental + (tier.derived ? ' (proportional)' : '') +
+      '\nFirst/last day at 75%. Provided meals deducted per GSA breakdown.\n';
+    el.detail.value = header + lines.join('\n') + '\nTOTAL M&IE: ' + money(total);
+    el.total.textContent = money(total);
+    el.grid.style.display = ''; el.gridHint.style.display = ''; el.totalRow.style.display = ''; el.detailRow.style.display = '';
+    send(true);
+    resize();
+  }
+
+  function record() {
+    return {
+      total: state.total || 0, rate: state.rate, fiscalYear: state.fy,
+      destination: state.manual ? 'manual' : (state.dest ? state.dest.label : ''),
+      state: el.state.value, depart: el.depart.value, return: el.ret.value,
+      manual: state.manual, ratesSource: (yearData(state.fy) || {}).source || '',
+      days: state.days.map(function (d) { return { date: d.date, kind: d.kind, base: d.base, provided: { b: d.b, l: d.l, d: d.d }, deducted: d.deducted, amount: d.amount }; }),
+      detail: el.detail.value
+    };
+  }
+  function valueString() { return outputMode === 'json' ? JSON.stringify(record()) : (state.total || 0).toFixed(2); }
+  function send(valid) { try { JFCustomWidget.sendData({ value: valid ? valueString() : '' }); } catch (e) {} }
+
+  // ---- events ----------------------------------------------------------------------
+  function onDates() {
+    buildDays();
+    var fy = el.depart.value ? fiscalYear(el.depart.value) : null;
+    if (fy && el.state.value && state.fy !== fy) { selectState(); }   // fiscal year changed: reload list
+    compute();
+  }
+  el.depart.addEventListener('change', onDates);
+  el.ret.addEventListener('change', onDates);
+  el.state.addEventListener('change', function () { selectState(); compute(); });
+  el.loc.addEventListener('change', compute);
+  el.manualRate.addEventListener('change', compute);
+  el.body.addEventListener('change', function (e) {
+    var t = e.target; if (t.type !== 'checkbox') return;
+    state.days[+t.getAttribute('data-i')][t.getAttribute('data-m')] = t.checked; compute();
+  });
+  $('copyBtn').addEventListener('click', function () {
+    el.detail.select();
+    var ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+    if (navigator.clipboard) navigator.clipboard.writeText(el.detail.value).then(function () { $('copyMsg').textContent = 'Copied.'; }, function () {});
+    else $('copyMsg').textContent = ok ? 'Copied.' : 'Select the text and copy it.';
+  });
+
+  // ---- Jotform lifecycle -------------------------------------------------------------
+  JFCustomWidget.subscribe('ready', function (data) {
+    ratesUrl = JFCustomWidget.getWidgetSetting('rates_url') || ratesUrl;
+    outputMode = (JFCustomWidget.getWidgetSetting('output') || 'number').toLowerCase();
+    loadRates().then(function () {
+      if (!rates) setStatus('Rate file could not be loaded (' + ratesError + ') - rates must be chosen manually.', 'warn');
+      // Restore when editing a submission saved in json mode.
+      if (data && data.value && data.value.charAt(0) === '{') {
+        try {
+          var r = JSON.parse(data.value);
+          el.depart.value = r.depart || ''; el.ret.value = r.return || ''; el.state.value = r.state || '';
+          buildDays();
+          (r.days || []).forEach(function (d, i) { if (state.days[i]) { state.days[i].b = d.provided.b; state.days[i].l = d.provided.l; state.days[i].d = d.provided.d; } });
+          selectState();
+          for (var i = 0; i < localities.length; i++) if (localities[i].label === r.destination) el.loc.value = i;
+          compute();
+        } catch (e) {}
+      }
+      resize();
+    });
+  });
+
+  JFCustomWidget.subscribe('submit', function () {
+    var ok = !!(state.days.length && state.rate !== null);
+    JFCustomWidget.sendSubmit({ valid: ok || !JFCustomWidget.isWidgetRequired(), value: ok ? valueString() : '' });
+  });
+})();
+</script>
+</body>
+</html>
